@@ -110,6 +110,9 @@ export function readConfig(): DriveConfig {
 
 export function getOAuthRedirectUri(config: DriveConfig): string {
   const redirectUri = config.redirectUri?.trim();
+  if (!redirectUri && process.env.NODE_ENV !== "production") {
+    return "http://localhost:8080/auth/google/callback";
+  }
   if (!redirectUri) {
     throw new DriveError(
       "Missing configuration: GOOGLE_REDIRECT_URI. Set it to the exact callback URI registered in Google Cloud Console.",
