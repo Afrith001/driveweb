@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { fetchFileContent, getFileMeta, isConfigured, DriveError } from "@/lib/drive.server";
+import { applyOAuthCookie, fetchFileContent, getFileMeta, isConfigured, DriveError } from "@/lib/drive.server";
 import { errorResponse } from "@/lib/api-utils.server";
 
 /** Inline streaming endpoint used by <img>, <video> and the PDF viewer. */
@@ -11,8 +11,8 @@ export const Route = createFileRoute("/api/files/$fileId/preview")({
           if (!isConfigured()) throw new DriveError("Google Drive is not configured.", 503);
           const range = request.headers.get("range");
           const [meta, upstream] = await Promise.all([
-            getFileMeta(params.fileId),
-            fetchFileContent(params.fileId, range),
+            getFileMeta(params.fileId, request),
+            fetchFileContent(params.fileId, request, range),
           ]);
           const headers = new Headers();
           headers.set("Content-Type", meta.mimeType || "application/octet-stream");
@@ -22,7 +22,7 @@ export const Route = createFileRoute("/api/files/$fileId/preview")({
             const v = upstream.headers.get(h);
             if (v) headers.set(h, v);
           }
-          return new Response(upstream.body, { status: upstream.status, headers });
+          return applyOAuthCookie(new Response(upstream.body, { status: upstream.status, headers }), request);
         } catch (e) {
           return errorResponse(e);
         }

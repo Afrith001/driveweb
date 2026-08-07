@@ -4,7 +4,7 @@ import { isConfigured, isAuthorized, readConfig } from "@/lib/drive.server";
 export const Route = createFileRoute("/api/config")({
   server: {
     handlers: {
-      GET: async () => {
+      GET: async ({ request }) => {
         let authType: "service_account" | "oauth" | "none" = "none";
         try {
           authType = readConfig().authType;
@@ -13,7 +13,7 @@ export const Route = createFileRoute("/api/config")({
         }
         return Response.json({
           configured: isConfigured(),
-          authorized: isAuthorized(),
+          authorized: isAuthorized(request),
           authType,
         });
       },

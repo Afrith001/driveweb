@@ -1,6 +1,3 @@
-import * as fs from "fs";
-import * as path from "path";
-
 /**
  * Google Drive access library.
  * Supports both Google OAuth2 client and Service Account.
@@ -11,6 +8,8 @@ const DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const SCOPE = "https://www.googleapis.com/auth/drive";
 const DRIVE_ROOT_ID = "root";
+const OAUTH_COOKIE = "drive_oauth_session";
+const OAUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30;
 
 export const FOLDER_MIME = "application/vnd.google-apps.folder";
 
@@ -27,11 +26,10 @@ export type DriveConfig = {
   privateKey?: string;
   clientId?: string;
   clientSecret?: string;
+  redirectUri?: string;
   rootFolderId: string;
   authType: "service_account" | "oauth" | "none";
 };
-
-const TOKENS_PATH = path.resolve(process.cwd(), ".tokens.json");
 
 export type OAuthTokens = {
   access_token: string;
@@ -39,36 +37,44 @@ export type OAuthTokens = {
   expiry_date?: number;
 };
 
-export function getStoredTokens(): OAuthTokens | null {
-  try {
-    if (fs.existsSync(TOKENS_PATH)) {
-      const data = fs.readFileSync(TOKENS_PATH, "utf-8");
-      return JSON.parse(data) as OAuthTokens;
-    }
-  } catch (e) {
-    console.error("Failed to read tokens file:", e);
-  }
-  return null;
+const refreshedTokens = new WeakMap<Request, OAuthTokens>();
+
+function parseCookies(request: Request): Record<string, string> {
+  const header = request.headers.get("cookie") ?? "";
+  return Object.fromEntries(
+    header.split(";").flatMap((part) => {
+      const separator = part.indexOf("=");
+      if (separator < 0) return [];
+      const name = part.slice(0, separator).trim();
+      const value = part.slice(separator + 1).trim();
+      return name ? [[name, value]] : [];
+    }),
+  );
 }
 
-export function saveStoredTokens(tokens: OAuthTokens): void {
+export function getStoredTokens(request: Request): OAuthTokens | null {
+  const value = parseCookies(request)[OAUTH_COOKIE];
+  if (!value) return null;
   try {
-    const existing = getStoredTokens() || {};
-    const updated = { ...existing, ...tokens };
-    fs.writeFileSync(TOKENS_PATH, JSON.stringify(updated, null, 2), "utf-8");
-  } catch (e) {
-    console.error("Failed to save tokens file:", e);
+    const tokens = JSON.parse(decodeURIComponent(value)) as OAuthTokens;
+    return tokens.access_token && tokens.refresh_token ? tokens : null;
+  } catch {
+    return null;
   }
 }
 
-export function clearStoredTokens(): void {
-  try {
-    if (fs.existsSync(TOKENS_PATH)) {
-      fs.unlinkSync(TOKENS_PATH);
-    }
-  } catch (e) {
-    console.error("Failed to clear tokens file:", e);
-  }
+export function oauthCookieHeader(tokens: OAuthTokens, clear = false): string {
+  const value = clear ? "" : encodeURIComponent(JSON.stringify(tokens));
+  const secure = process.env.NODE_ENV === "production" ? "; Secure" : "";
+  return `${OAUTH_COOKIE}=${value}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${clear ? 0 : OAUTH_COOKIE_MAX_AGE}${secure}`;
+}
+
+export function applyOAuthCookie(response: Response, request: Request): Response {
+  const tokens = refreshedTokens.get(request);
+  if (!tokens) return response;
+  const headers = new Headers(response.headers);
+  headers.append("Set-Cookie", oauthCookieHeader(tokens));
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 export function readConfig(): DriveConfig {
@@ -76,6 +82,7 @@ export function readConfig(): DriveConfig {
   const rawKey = process.env["GOOGLE_PRIVATE_KEY"];
   const clientId = process.env["GOOGLE_CLIENT_ID"];
   const clientSecret = process.env["GOOGLE_CLIENT_SECRET"];
+  const redirectUri = process.env["GOOGLE_REDIRECT_URI"];
   const rootFolderId = process.env["GOOGLE_DRIVE_FOLDER_ID"];
 
   if (clientEmail && rawKey) {
@@ -89,6 +96,7 @@ export function readConfig(): DriveConfig {
     return {
       clientId,
       clientSecret,
+      redirectUri,
       rootFolderId: rootFolderId || DRIVE_ROOT_ID,
       authType: "oauth",
     };
@@ -100,6 +108,17 @@ export function readConfig(): DriveConfig {
   };
 }
 
+export function getOAuthRedirectUri(config: DriveConfig): string {
+  const redirectUri = config.redirectUri?.trim();
+  if (!redirectUri) {
+    throw new DriveError(
+      "Missing configuration: GOOGLE_REDIRECT_URI. Set it to the exact callback URI registered in Google Cloud Console.",
+      503,
+    );
+  }
+  return redirectUri;
+}
+
 export function isConfigured(): boolean {
   try {
     const config = readConfig();
@@ -109,12 +128,12 @@ export function isConfigured(): boolean {
   }
 }
 
-export function isAuthorized(): boolean {
+export function isAuthorized(request?: Request): boolean {
   try {
     const config = readConfig();
     if (config.authType === "service_account") return true;
     if (config.authType === "oauth") {
-      const tokens = getStoredTokens();
+      const tokens = request ? getStoredTokens(request) : null;
       return !!(tokens && tokens.access_token);
     }
     return false;
@@ -148,6 +167,7 @@ function pemToPkcs8(pem: string): ArrayBuffer {
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
 async function refreshOAuthToken(
+  request: Request,
   clientId: string,
   clientSecret: string,
   refreshToken: string,
@@ -165,25 +185,23 @@ async function refreshOAuthToken(
 
   if (!res.ok) {
     const body = await res.text();
-    if (res.status === 400 || res.status === 401) {
-      clearStoredTokens();
-    }
     throw new Error(`Google token refresh failed [${res.status}]: ${body}`);
   }
 
   const json = (await res.json()) as { access_token: string; expires_in: number; refresh_token?: string };
   const updatedTokens: OAuthTokens = {
     access_token: json.access_token,
+    refresh_token: refreshToken,
     expiry_date: Date.now() + json.expires_in * 1000,
   };
   if (json.refresh_token) {
     updatedTokens.refresh_token = json.refresh_token;
   }
-  saveStoredTokens(updatedTokens);
+  refreshedTokens.set(request, updatedTokens);
   return json.access_token;
 }
 
-export async function getAccessToken(): Promise<string> {
+export async function getAccessToken(request?: Request): Promise<string> {
   const config = readConfig();
 
   if (config.authType === "service_account") {
@@ -248,7 +266,8 @@ export async function getAccessToken(): Promise<string> {
     cachedToken = { token: json.access_token, expiresAt: now + json.expires_in };
     return json.access_token;
   } else if (config.authType === "oauth") {
-    const tokens = getStoredTokens();
+    if (!request) throw new DriveError("OAuth request context is missing.", 500);
+    const tokens = getStoredTokens(request);
     if (!tokens || !tokens.access_token) {
       throw new DriveError("Application is not authorized. Please connect your Google Drive.", 401);
     }
@@ -262,14 +281,14 @@ export async function getAccessToken(): Promise<string> {
       throw new DriveError("Access token expired and no refresh token is available. Please connect again.", 401);
     }
 
-    return await refreshOAuthToken(config.clientId!, config.clientSecret!, tokens.refresh_token);
+    return await refreshOAuthToken(request, config.clientId!, config.clientSecret!, tokens.refresh_token);
   } else {
     throw new DriveError("Google Drive is not configured.", 503);
   }
 }
 
-async function driveFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  const token = await getAccessToken();
+async function driveFetch(url: string, init: RequestInit = {}, request?: Request): Promise<Response> {
+  const token = await getAccessToken(request);
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
   let res: Response;
@@ -288,11 +307,11 @@ async function driveFetch(url: string, init: RequestInit = {}): Promise<Response
   return res;
 }
 
-async function getWorkingRootId(): Promise<string> {
+async function getWorkingRootId(request: Request): Promise<string> {
   const { rootFolderId } = readConfig();
   if (rootFolderId === DRIVE_ROOT_ID) return DRIVE_ROOT_ID;
   try {
-    await getFolderMeta(rootFolderId);
+    await getFolderMeta(rootFolderId, request);
     return rootFolderId;
   } catch (error) {
     const status = error instanceof DriveError ? error.status : 0;
@@ -301,10 +320,10 @@ async function getWorkingRootId(): Promise<string> {
   }
 }
 
-async function resolveParentId(parentId?: string): Promise<string> {
-  if (!parentId) return getWorkingRootId();
-  if (await isAccessibleFolder(parentId)) return parentId;
-  return getWorkingRootId();
+async function resolveParentId(parentId: string | undefined, request: Request): Promise<string> {
+  if (!parentId) return getWorkingRootId(request);
+  if (await isAccessibleFolder(parentId, request)) return parentId;
+  return getWorkingRootId(request);
 }
 
 /* ---------------------------------- types -------------------------------- */
@@ -351,8 +370,8 @@ function toItem(f: RawFile): DriveItem {
 
 /* -------------------------------- operations ------------------------------ */
 
-export async function listChildren(folderId?: string): Promise<DriveItem[]> {
-  const parent = folderId || (await getWorkingRootId());
+export async function listChildren(folderId: string | undefined, request: Request): Promise<DriveItem[]> {
+  const parent = folderId || (await getWorkingRootId(request));
   const items: DriveItem[] = [];
   let pageToken: string | undefined;
 
@@ -366,7 +385,7 @@ export async function listChildren(folderId?: string): Promise<DriveItem[]> {
       includeItemsFromAllDrives: "true",
     });
     if (pageToken) params.set("pageToken", pageToken);
-    const res = await driveFetch(`${DRIVE_API}/files?${params}`);
+    const res = await driveFetch(`${DRIVE_API}/files?${params}`, {}, request);
     const json = (await res.json()) as { files: RawFile[]; nextPageToken?: string };
     items.push(...(json.files ?? []).map(toItem));
     pageToken = json.nextPageToken;
@@ -375,35 +394,58 @@ export async function listChildren(folderId?: string): Promise<DriveItem[]> {
   return items;
 }
 
+export async function listFolders(request: Request): Promise<DriveItem[]> {
+  const items: DriveItem[] = [];
+  let pageToken: string | undefined;
+  do {
+    const params = new URLSearchParams({
+      q: `mimeType = '${FOLDER_MIME}' and trashed = false`,
+      fields: FIELDS,
+      pageSize: "200",
+      orderBy: "name",
+      supportsAllDrives: "true",
+      includeItemsFromAllDrives: "true",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const res = await driveFetch(`${DRIVE_API}/files?${params}`, {}, request);
+    const json = (await res.json()) as { files: RawFile[]; nextPageToken?: string };
+    items.push(...(json.files ?? []).map(toItem));
+    pageToken = json.nextPageToken;
+  } while (pageToken);
+  return items;
+}
+
 export async function getFolderMeta(
   folderId: string,
+  request: Request,
 ): Promise<{ id: string; name: string; parentId: string | null }> {
   const params = new URLSearchParams({
     fields: "id,name,parents",
     supportsAllDrives: "true",
   });
-  const res = await driveFetch(`${DRIVE_API}/files/${folderId}?${params}`);
+  const res = await driveFetch(`${DRIVE_API}/files/${folderId}?${params}`, {}, request);
   const json = (await res.json()) as { id: string; name: string; parents?: string[] };
   return { id: json.id, name: json.name, parentId: json.parents?.[0] ?? null };
 }
 
 export async function getBreadcrumb(
   folderId: string,
+  request: Request,
 ): Promise<Array<{ id: string; name: string }>> {
-  const rootFolderId = await getWorkingRootId();
+  const rootFolderId = await getWorkingRootId(request);
   const trail: Array<{ id: string; name: string }> = [];
   let current: string | null = folderId;
   let guard = 0;
   while (current && current !== rootFolderId && guard++ < 20) {
-    const meta = await getFolderMeta(current);
+    const meta = await getFolderMeta(current, request);
     trail.unshift({ id: meta.id, name: meta.name });
     current = meta.parentId;
   }
   return trail;
 }
 
-export async function createFolder(name: string, parentId?: string): Promise<DriveItem> {
-  const parent = await resolveParentId(parentId);
+export async function createFolder(name: string, parentId: string | undefined, request: Request): Promise<DriveItem> {
+  const parent = await resolveParentId(parentId, request);
   const params = new URLSearchParams({
     fields: "id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink",
     supportsAllDrives: "true",
@@ -412,13 +454,14 @@ export async function createFolder(name: string, parentId?: string): Promise<Dri
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parent] }),
-  });
+  }, request);
   return toItem((await res.json()) as RawFile);
 }
 
 export async function findFolderByName(
   name: string,
   parentId: string,
+  request: Request,
 ): Promise<DriveItem | null> {
   const escaped = name.replace(/'/g, "\\'");
   const params = new URLSearchParams({
@@ -428,23 +471,23 @@ export async function findFolderByName(
     supportsAllDrives: "true",
     includeItemsFromAllDrives: "true",
   });
-  const res = await driveFetch(`${DRIVE_API}/files?${params}`);
+  const res = await driveFetch(`${DRIVE_API}/files?${params}`, {}, request);
   const json = (await res.json()) as { files: RawFile[] };
   return json.files?.[0] ? toItem(json.files[0]!) : null;
 }
 
 /** Returns the YYYY-MM-DD folder inside `parentId`, creating it only if absent. */
-export async function ensureDateFolder(parentId: string, date = new Date()): Promise<string> {
+export async function ensureDateFolder(parentId: string, request: Request, date = new Date()): Promise<string> {
   const name = date.toISOString().slice(0, 10);
-  const existing = await findFolderByName(name, parentId);
+  const existing = await findFolderByName(name, parentId, request);
   if (existing) return existing.id;
-  const created = await createFolder(name, parentId);
+  const created = await createFolder(name, parentId, request);
   return created.id;
 }
 
-async function isAccessibleFolder(folderId: string): Promise<boolean> {
+async function isAccessibleFolder(folderId: string, request: Request): Promise<boolean> {
   try {
-    await getFolderMeta(folderId);
+    await getFolderMeta(folderId, request);
     return true;
   } catch (error) {
     const status = error instanceof DriveError ? error.status : 0;
@@ -456,15 +499,16 @@ async function isAccessibleFolder(folderId: string): Promise<boolean> {
 export async function uploadFile(
   file: File,
   opts: { parentId?: string; useDateFolder?: boolean } = {},
+  request: Request,
 ): Promise<DriveItem> {
-  const rootFolderId = await getWorkingRootId();
+  const rootFolderId = await getWorkingRootId(request);
   let parent: string | undefined;
 
-  if (await isAccessibleFolder(opts.parentId || rootFolderId)) {
+  if (await isAccessibleFolder(opts.parentId || rootFolderId, request)) {
     parent = opts.parentId || rootFolderId;
-    if (opts.useDateFolder) {
+    if (opts.useDateFolder && !opts.parentId) {
       try {
-        parent = await ensureDateFolder(parent);
+        parent = await ensureDateFolder(parent, request);
       } catch (error) {
         const status = error instanceof DriveError ? error.status : 0;
         if (status !== 403 && status !== 404) throw error;
@@ -495,7 +539,7 @@ export async function uploadFile(
       method: "POST",
       headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
       body: createBody(parent),
-    });
+    }, request);
   } catch (error) {
     const status = error instanceof DriveError ? error.status : 0;
     if (!parent || (status !== 403 && status !== 404)) throw error;
@@ -503,32 +547,33 @@ export async function uploadFile(
       method: "POST",
       headers: { "Content-Type": `multipart/related; boundary=${boundary}` },
       body: createBody(),
-    });
+    }, request);
   }
   return toItem((await res.json()) as RawFile);
 }
 
-export async function deleteFile(fileId: string): Promise<void> {
+export async function deleteFile(fileId: string, request: Request): Promise<void> {
   const params = new URLSearchParams({ supportsAllDrives: "true" });
-  await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`, { method: "DELETE" });
+  await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`, { method: "DELETE" }, request);
 }
 
-export async function getFileMeta(fileId: string): Promise<DriveItem> {
+export async function getFileMeta(fileId: string, request: Request): Promise<DriveItem> {
   const params = new URLSearchParams({
     fields: "id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink",
     supportsAllDrives: "true",
   });
-  const res = await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`);
+  const res = await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`, {}, request);
   return toItem((await res.json()) as RawFile);
 }
 
 /** Streams the raw file bytes from Drive. */
 export async function fetchFileContent(
   fileId: string,
+  request: Request,
   range?: string | null,
 ): Promise<Response> {
   const params = new URLSearchParams({ alt: "media", supportsAllDrives: "true" });
-  const token = await getAccessToken();
+  const token = await getAccessToken(request);
   const headers = new Headers({ Authorization: `Bearer ${token}` });
   if (range) headers.set("Range", range);
   const res = await fetch(`${DRIVE_API}/files/${fileId}?${params}`, { headers });
@@ -537,4 +582,34 @@ export async function fetchFileContent(
     throw new DriveError(`Google Drive download failed [${res.status}]: ${body}`, res.status);
   }
   return res;
+}
+
+export async function renameFile(fileId: string, name: string, request: Request): Promise<DriveItem> {
+  const params = new URLSearchParams({
+    fields: "id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink",
+    supportsAllDrives: "true",
+  });
+  const res = await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  }, request);
+  return toItem((await res.json()) as RawFile);
+}
+
+export async function moveFile(fileId: string, destinationId: string, request: Request): Promise<DriveItem> {
+  const metaParams = new URLSearchParams({ fields: "id,parents", supportsAllDrives: "true" });
+  const metaResponse = await driveFetch(`${DRIVE_API}/files/${fileId}?${metaParams}`, {}, request);
+  const meta = (await metaResponse.json()) as { id: string; parents?: string[] };
+  const params = new URLSearchParams({
+    addParents: destinationId,
+    supportsAllDrives: "true",
+    fields: "id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink",
+  });
+  if (meta.parents?.length) params.set("removeParents", meta.parents.join(","));
+  const res = await driveFetch(`${DRIVE_API}/files/${fileId}?${params}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+  }, request);
+  return toItem((await res.json()) as RawFile);
 }

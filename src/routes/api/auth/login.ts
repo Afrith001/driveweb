@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { readConfig, DriveError } from "@/lib/drive.server";
+import { getOAuthRedirectUri, readConfig, DriveError } from "@/lib/drive.server";
 
 export const Route = createFileRoute("/api/auth/login")({
   server: {
@@ -11,8 +11,8 @@ export const Route = createFileRoute("/api/auth/login")({
             throw new DriveError("Google OAuth is not configured in the environment variables.", 400);
           }
 
-          const url = new URL(request.url);
-          const redirectUri = `${url.protocol}//${url.host}/auth/google/callback`;
+          const redirectUri = getOAuthRedirectUri(config);
+          console.info("Google OAuth redirect URI:", redirectUri);
 
           const googleAuthUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
           googleAuthUrl.searchParams.set("response_type", "code");

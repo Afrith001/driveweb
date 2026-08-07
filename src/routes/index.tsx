@@ -8,6 +8,7 @@ import {
   FolderPlus,
   HardDrive,
   Loader2,
+  MoreVertical,
   Search,
   Trash2,
   Upload,
@@ -44,8 +45,12 @@ import {
   createFolder,
   deleteItem,
   fetchConfigured,
+  fetchFolders,
   fetchItems,
+  formatDate,
   formatSize,
+  moveItem,
+  renameItem,
   uploadFile,
   type Crumb,
   type DriveItem,
@@ -92,6 +97,9 @@ function DriveManager() {
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [pendingDelete, setPendingDelete] = useState<DriveItem | null>(null);
+  const [renameTarget, setRenameTarget] = useState<DriveItem | null>(null);
+  const [renameName, setRenameName] = useState("");
+  const [moveTarget, setMoveTarget] = useState<DriveItem | null>(null);
 
   const config = useQuery({ queryKey: ["config"], queryFn: fetchConfigured });
 
@@ -99,7 +107,12 @@ function DriveManager() {
     queryKey: ["items", folderId],
     queryFn: async () => {
       const data = await fetchItems(folderId);
-      setBreadcrumb(data.breadcrumb);
+      const uniqueBreadcrumb = data.breadcrumb.filter(
+        (crumb, index, crumbs) =>
+          crumbs.findIndex((candidate) => candidate.id === crumb.id) === index,
+      );
+      if (uniqueBreadcrumb[0]?.name === "My Drive") uniqueBreadcrumb.shift();
+      setBreadcrumb(uniqueBreadcrumb);
       return data.items;
     },
     enabled: config.data?.authorized === true,
@@ -133,7 +146,7 @@ function DriveManager() {
         const file = selected[i]!;
         const task = tasks[i]!;
         try {
-          await uploadFile(file, { parentId: folderId, useDateFolder: dateFolders }, (p) =>
+          await uploadFile(file, { parentId: folderId, useDateFolder: !folderId && dateFolders }, (p) =>
             setUploads((prev) =>
               prev.map((t) => (t.id === task.id ? { ...t, progress: p } : t)),
             ),
@@ -179,6 +192,34 @@ function DriveManager() {
       refresh();
     },
     onError: (e: Error) => toast.error(e.message),
+  });
+
+  const renameMutation = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) => renameItem(id, name),
+    onSuccess: () => {
+      toast.success("Renamed");
+      setRenameTarget(null);
+      setRenameName("");
+      refresh();
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const moveMutation = useMutation({
+    mutationFn: ({ id, destinationId }: { id: string; destinationId: string }) =>
+      moveItem(id, destinationId),
+    onSuccess: () => {
+      toast.success("Moved");
+      setMoveTarget(null);
+      void refresh();
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const folderPicker = useQuery({
+    queryKey: ["folders"],
+    queryFn: fetchFolders,
+    enabled: !!moveTarget,
   });
 
   const activeUploads = uploads.filter((u) => u.status === "uploading").length;
@@ -367,16 +408,38 @@ function DriveManager() {
                               <FileTypeIcon isFolder mimeType={f.mimeType} className="size-12" />
                             </span>
                             <span className="w-full truncate text-sm font-medium" title={f.name}>{f.name}</span>
+                            <span className="text-[11px] text-muted-foreground">{formatDate(f.createdTime)}</span>
                           </button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            aria-label={`Delete ${f.name}`}
-                            onClick={() => setPendingDelete(f)}
-                            className="absolute right-1 top-1 opacity-0 transition-opacity group-hover:opacity-100"
-                          >
-                            <Trash2 className="size-4" />
-                          </Button>
+                          <div className="absolute right-1 top-1 flex opacity-0 transition-opacity group-hover:opacity-100">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Rename ${f.name}`}
+                              onClick={() => {
+                                setRenameTarget(f);
+                                setRenameName(f.name);
+                              }}
+                            >
+                              <MoreVertical className="size-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Move ${f.name}`}
+                              onClick={() => setMoveTarget(f)}
+                              className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                            >
+                              <MoreVertical className="size-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              aria-label={`Delete ${f.name}`}
+                              onClick={() => setPendingDelete(f)}
+                            >
+                              <Trash2 className="size-4" />
+                            </Button>
+                          </div>
                         </div>
                       ))}
                     </div>
@@ -424,7 +487,10 @@ function DriveManager() {
                             <p className="min-w-0 flex-1 truncate text-sm font-medium" title={f.name}>
                               {f.name}
                             </p>
-                            <span className="text-xs text-muted-foreground">{formatSize(f.size)}</span>
+                            <div className="flex min-w-0 flex-col items-end text-right">
+                              <span className="text-xs text-muted-foreground">{formatSize(f.size)}</span>
+                              <span className="text-[11px] text-muted-foreground">{formatDate(f.createdTime)}</span>
+                            </div>
                             <Button
                               variant="ghost"
                               size="icon"
@@ -447,6 +513,65 @@ function DriveManager() {
       </main>
 
       <PreviewDialog item={preview} onClose={() => setPreview(null)} />
+
+      <Dialog open={!!moveTarget} onOpenChange={(open) => !open && setMoveTarget(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Move file</DialogTitle>
+            <DialogDescription>Select a destination folder for {moveTarget?.name}.</DialogDescription>
+          </DialogHeader>
+          <div className="max-h-72 space-y-1 overflow-y-auto">
+            {folderPicker.isLoading && <Skeleton className="h-10 w-full" />}
+            {folderPicker.isError && (
+              <p className="text-sm text-destructive">{(folderPicker.error as Error).message}</p>
+            )}
+            {folderPicker.data?.map((folder) => (
+              <Button
+                key={folder.id}
+                variant="ghost"
+                className="w-full justify-start gap-3"
+                disabled={folder.id === moveTarget?.id || moveMutation.isPending}
+                onClick={() => moveTarget && moveMutation.mutate({ id: moveTarget.id, destinationId: folder.id })}
+              >
+                <FileTypeIcon isFolder mimeType={folder.mimeType} className="size-5 text-amber-500" />
+                <span className="truncate">{folder.name}</span>
+              </Button>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMoveTarget(null)}>Cancel</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!renameTarget} onOpenChange={(open) => !open && setRenameTarget(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Rename folder</DialogTitle>
+            <DialogDescription>Enter a new name for {renameTarget?.name}.</DialogDescription>
+          </DialogHeader>
+          <Input
+            autoFocus
+            value={renameName}
+            onChange={(e) => setRenameName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && renameTarget && renameName.trim()) {
+                renameMutation.mutate({ id: renameTarget.id, name: renameName.trim() });
+              }
+            }}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenameTarget(null)}>Cancel</Button>
+            <Button
+              disabled={!renameName.trim() || renameMutation.isPending}
+              onClick={() => renameTarget && renameMutation.mutate({ id: renameTarget.id, name: renameName.trim() })}
+            >
+              {renameMutation.isPending && <Loader2 className="size-4 animate-spin" />}
+              Rename
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={newFolderOpen} onOpenChange={setNewFolderOpen}>
         <DialogContent className="sm:max-w-sm">

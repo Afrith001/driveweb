@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { readConfig, saveStoredTokens, DriveError } from "@/lib/drive.server";
+import { getOAuthRedirectUri, oauthCookieHeader, readConfig, DriveError } from "@/lib/drive.server";
 
 export const Route = createFileRoute("/auth/google/callback")({
   server: {
@@ -12,12 +12,11 @@ export const Route = createFileRoute("/auth/google/callback")({
           }
 
           const url = new URL(request.url);
+          const redirectUri = getOAuthRedirectUri(config);
           const code = url.searchParams.get("code");
           if (!code) {
             throw new DriveError("No authorization code was returned by Google.", 400);
           }
-
-          const redirectUri = `${url.protocol}//${url.host}/auth/google/callback`;
 
           const res = await fetch("https://oauth2.googleapis.com/token", {
             method: "POST",
@@ -49,17 +48,18 @@ export const Route = createFileRoute("/auth/google/callback")({
             );
           }
 
-          saveStoredTokens({
+          const tokens = {
             access_token: json.access_token,
             refresh_token: json.refresh_token,
             expiry_date: Date.now() + json.expires_in * 1000,
-          });
+          };
 
           // Redirect back to root
           return new Response(null, {
             status: 302,
             headers: {
               Location: "/",
+              "Set-Cookie": oauthCookieHeader(tokens),
             },
           });
         } catch (e) {

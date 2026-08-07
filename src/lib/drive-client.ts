@@ -40,6 +40,31 @@ export async function createFolder(name: string, parentId: string | null): Promi
   if (!res.ok) throw new Error(await readError(res));
 }
 
+export async function renameItem(id: string, name: string): Promise<void> {
+  const res = await fetch(`/api/files/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+}
+
+export async function fetchFolders(): Promise<DriveItem[]> {
+  const res = await fetch("/api/folders");
+  if (!res.ok) throw new Error(await readError(res));
+  const json = (await res.json()) as { folders: DriveItem[] };
+  return json.folders;
+}
+
+export async function moveItem(id: string, destinationId: string): Promise<void> {
+  const res = await fetch(`/api/files/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ destinationId }),
+  });
+  if (!res.ok) throw new Error(await readError(res));
+}
+
 export async function deleteItem(id: string): Promise<void> {
   const res = await fetch(`/api/files/${id}`, { method: "DELETE" });
   if (!res.ok) throw new Error(await readError(res));
@@ -107,10 +132,12 @@ export function formatSize(bytes: number | null): string {
 }
 
 export function formatDate(iso: string): string {
-  return new Date(iso).toLocaleDateString(undefined, {
+  return new Date(iso).toLocaleString(undefined, {
     year: "numeric",
     month: "short",
     day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   });
 }
 

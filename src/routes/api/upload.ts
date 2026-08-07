@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { DriveError, isConfigured, uploadFile } from "@/lib/drive.server";
+import { applyOAuthCookie, DriveError, isConfigured, uploadFile } from "@/lib/drive.server";
 import { errorResponse } from "@/lib/api-utils.server";
 
 const MAX_BYTES = 100 * 1024 * 1024; // 100 MB per request
@@ -26,8 +26,8 @@ export const Route = createFileRoute("/api/upload")({
           const uploaded = await uploadFile(file, {
             useDateFolder,
             ...(parentId ? { parentId } : {}),
-          });
-          return Response.json({ file: uploaded });
+          }, request);
+          return applyOAuthCookie(Response.json({ file: uploaded }), request);
         } catch (e) {
           return errorResponse(e);
         }
