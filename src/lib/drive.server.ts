@@ -82,7 +82,11 @@ export function readConfig(): DriveConfig {
   const rawKey = process.env["GOOGLE_PRIVATE_KEY"];
   const clientId = process.env["GOOGLE_CLIENT_ID"];
   const clientSecret = process.env["GOOGLE_CLIENT_SECRET"];
-  const redirectUri = process.env["GOOGLE_REDIRECT_URI"];
+  const redirectUri = process.env["GOOGLE_REDIRECT_URI"]?.trim();
+  console.info(
+    "[OAuth config] GOOGLE_REDIRECT_URI:",
+    redirectUri ? "found" : "undefined",
+  );
   const rootFolderId = process.env["GOOGLE_DRIVE_FOLDER_ID"];
 
   if (clientEmail && rawKey) {
